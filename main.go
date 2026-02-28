@@ -1,6 +1,17 @@
 package main
 
-import "os"
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/joho/godotenv"
+	amqp "github.com/rabbitmq/amqp091-go"
+)
 
 const telegramAPI = "https://api.telegram.org/bot"
 
@@ -32,8 +43,120 @@ type UpdatesResponse struct {
 	Result []Update `json:"result"`
 }
 
-func main() {
-	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
-	chatID := os.Getenv("TELEGRAM_CHAT_ID")
+type RabbitMessage struct {
+	ChatID    int64  `json:"chat_id"`
+	Text      string `json:"text"`
+	Author    string `json:"author"`
+	Timestamp string `json:"timestamp"`
+}
 
+func getUpdates(token string) ([]Update, error) {
+	apiURL := fmt.Sprintf("%s%s/getUpdates", telegramAPI, token)
+
+	resp, err := http.Get(apiURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var result UpdatesResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+
+	if !result.OK {
+		return nil, fmt.Errorf("telegram API returned not OK")
+	}
+
+	return result.Result, nil
+}
+
+func publishToRabbit(ch *amqp.Channel, queueName string, msg RabbitMessage) error {
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Published: %s\n", body)
+
+	return ch.Publish(
+		"",        // exchange
+		queueName, // routing key
+		false,     // mandatory
+		false,     // immediate
+		amqp.Publishing{
+			ContentType: "application/json",
+			Body:        body,
+		},
+	)
+}
+
+func main() {
+	if err := godotenv.Load(); err != nil {
+		log.Fatal("Error loading .env file")
+	}
+
+	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	rabbitURL := os.Getenv("RABBITMQ_URL")
+	queueName := os.Getenv("RABBITMQ_QUEUE")
+
+	conn, err := amqp.Dial(rabbitURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("Failed to open channel: %v", err)
+	}
+	defer ch.Close()
+
+	_, err = ch.QueueDeclare(
+		queueName,
+		true,  // durable
+		false, // auto-delete
+		false, // exclusive
+		false, // no-wait
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("Failed to declare queue: %v", err)
+	}
+
+	updates, err := getUpdates(botToken)
+	if err != nil {
+		log.Fatalf("Error getting updates: %v", err)
+	}
+
+	for _, update := range updates {
+		if update.Message == nil || update.Message.Text == "" {
+			continue
+		}
+
+		msg := update.Message
+
+		author := msg.From.FirstName
+		if msg.From.Username != "" {
+			author = "@" + msg.From.Username
+		}
+
+		rabbitMsg := RabbitMessage{
+			ChatID:    msg.Chat.ID,
+			Text:      msg.Text,
+			Author:    author,
+			Timestamp: time.Unix(msg.Date, 0).Format(time.RFC3339),
+		}
+
+		if err := publishToRabbit(ch, queueName, rabbitMsg); err != nil {
+			log.Printf("Failed to publish message from %s: %v", author, err)
+		} else {
+			log.Printf("Published: chat_id=%d author=%s text=%q", rabbitMsg.ChatID, author, rabbitMsg.Text)
+		}
+	}
 }

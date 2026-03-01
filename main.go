@@ -34,8 +34,9 @@ type Message struct {
 }
 
 type Update struct {
-	UpdateID int      `json:"update_id"`
-	Message  *Message `json:"message"`
+	UpdateID      int      `json:"update_id"`
+	Message       *Message `json:"message"`
+	EditedMessage *Message `json:"edited_message"`
 }
 
 type UpdatesResponse struct {
@@ -44,10 +45,12 @@ type UpdatesResponse struct {
 }
 
 type RabbitMessage struct {
+	MessageID int    `json:"message_id"`
 	ChatID    int64  `json:"chat_id"`
 	Text      string `json:"text"`
 	Author    string `json:"author"`
 	Timestamp string `json:"timestamp"`
+	IsEdit    bool   `json:"is_edit"`
 }
 
 func getUpdates(token string) ([]Update, error) {
@@ -135,11 +138,18 @@ func main() {
 	}
 
 	for _, update := range updates {
-		if update.Message == nil || update.Message.Text == "" {
+		var msg *Message
+		isEdit := false
+
+		switch {
+		case update.Message != nil && update.Message.Text != "":
+			msg = update.Message
+		case update.EditedMessage != nil && update.EditedMessage.Text != "":
+			msg = update.EditedMessage
+			isEdit = true
+		default:
 			continue
 		}
-
-		msg := update.Message
 
 		author := msg.From.FirstName
 		if msg.From.Username != "" {
@@ -147,16 +157,18 @@ func main() {
 		}
 
 		rabbitMsg := RabbitMessage{
+			MessageID: msg.MessageID,
 			ChatID:    msg.Chat.ID,
 			Text:      msg.Text,
 			Author:    author,
 			Timestamp: time.Unix(msg.Date, 0).Format(time.RFC3339),
+			IsEdit:    isEdit,
 		}
 
 		if err := publishToRabbit(ch, queueName, rabbitMsg); err != nil {
 			log.Printf("Failed to publish message from %s: %v", author, err)
 		} else {
-			log.Printf("Published: chat_id=%d author=%s text=%q", rabbitMsg.ChatID, author, rabbitMsg.Text)
+			log.Printf("Published: chat_id=%d author=%s is_edit=%v text=%q", rabbitMsg.ChatID, author, isEdit, rabbitMsg.Text)
 		}
 	}
 }

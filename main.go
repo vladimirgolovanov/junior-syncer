@@ -11,6 +11,7 @@ import (
 
 	"github.com/joho/godotenv"
 	amqp "github.com/rabbitmq/amqp091-go"
+	rabbitmq "github.com/wagslane/go-rabbitmq"
 )
 
 const telegramAPI = "https://api.telegram.org/bot"
@@ -53,8 +54,8 @@ type RabbitMessage struct {
 	IsEdit    bool   `json:"is_edit"`
 }
 
-func getUpdates(token string) ([]Update, error) {
-	apiURL := fmt.Sprintf("%s%s/getUpdates", telegramAPI, token)
+func getUpdates(token string, offset int) ([]Update, error) {
+	apiURL := fmt.Sprintf("%s%s/getUpdates?offset=%d&timeout=30", telegramAPI, token, offset)
 
 	resp, err := http.Get(apiURL)
 	if err != nil {
@@ -79,7 +80,33 @@ func getUpdates(token string) ([]Update, error) {
 	return result.Result, nil
 }
 
-func publishToRabbit(ch *amqp.Channel, queueName string, msg RabbitMessage) error {
+// declareQueue создаёт очередь при старте через amqp091 напрямую.
+// go-rabbitmq не декларирует очереди на стороне publisher-а.
+func declareQueue(rabbitURL, queueName string) error {
+	conn, err := amqp.Dial(rabbitURL)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		return err
+	}
+	defer ch.Close()
+
+	_, err = ch.QueueDeclare(
+		queueName,
+		true,  // durable
+		false, // auto-delete
+		false, // exclusive
+		false, // no-wait
+		nil,
+	)
+	return err
+}
+
+func publishToRabbit(publisher *rabbitmq.Publisher, queueName string, msg RabbitMessage) error {
 	body, err := json.Marshal(msg)
 	if err != nil {
 		return err
@@ -87,15 +114,11 @@ func publishToRabbit(ch *amqp.Channel, queueName string, msg RabbitMessage) erro
 
 	fmt.Printf("Published: %s\n", body)
 
-	return ch.Publish(
-		"",        // exchange
-		queueName, // routing key
-		false,     // mandatory
-		false,     // immediate
-		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        body,
-		},
+	return publisher.Publish(
+		body,
+		[]string{queueName},
+		rabbitmq.WithPublishOptionsContentType("application/json"),
+		rabbitmq.WithPublishOptionsPersistentDelivery,
 	)
 }
 
@@ -108,67 +131,74 @@ func main() {
 	rabbitURL := os.Getenv("RABBITMQ_URL")
 	queueName := os.Getenv("RABBITMQ_QUEUE")
 
-	conn, err := amqp.Dial(rabbitURL)
+	if err := declareQueue(rabbitURL, queueName); err != nil {
+		log.Fatalf("Failed to declare queue: %v", err)
+	}
+
+	conn, err := rabbitmq.NewConn(
+		rabbitURL,
+		rabbitmq.WithConnectionOptionsLogging,
+	)
 	if err != nil {
 		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
 	}
 	defer conn.Close()
 
-	ch, err := conn.Channel()
-	if err != nil {
-		log.Fatalf("Failed to open channel: %v", err)
-	}
-	defer ch.Close()
-
-	_, err = ch.QueueDeclare(
-		queueName,
-		true,  // durable
-		false, // auto-delete
-		false, // exclusive
-		false, // no-wait
-		nil,
+	publisher, err := rabbitmq.NewPublisher(
+		conn,
+		rabbitmq.WithPublisherOptionsLogging,
 	)
 	if err != nil {
-		log.Fatalf("Failed to declare queue: %v", err)
+		log.Fatalf("Failed to create publisher: %v", err)
 	}
+	defer publisher.Close()
 
-	updates, err := getUpdates(botToken)
-	if err != nil {
-		log.Fatalf("Error getting updates: %v", err)
-	}
-
-	for _, update := range updates {
-		var msg *Message
-		isEdit := false
-
-		switch {
-		case update.Message != nil && update.Message.Text != "":
-			msg = update.Message
-		case update.EditedMessage != nil && update.EditedMessage.Text != "":
-			msg = update.EditedMessage
-			isEdit = true
-		default:
+	offset := 0
+	for {
+		updates, err := getUpdates(botToken, offset)
+		if err != nil {
+			log.Printf("Error getting updates: %v", err)
+			time.Sleep(5 * time.Second)
 			continue
 		}
 
-		author := msg.From.FirstName
-		if msg.From.Username != "" {
-			author = "@" + msg.From.Username
-		}
+		for _, update := range updates {
+			if update.UpdateID >= offset {
+				offset = update.UpdateID + 1
+			}
 
-		rabbitMsg := RabbitMessage{
-			MessageID: msg.MessageID,
-			ChatID:    msg.Chat.ID,
-			Text:      msg.Text,
-			Author:    author,
-			Timestamp: time.Unix(msg.Date, 0).Format(time.RFC3339),
-			IsEdit:    isEdit,
-		}
+			var msg *Message
+			isEdit := false
 
-		if err := publishToRabbit(ch, queueName, rabbitMsg); err != nil {
-			log.Printf("Failed to publish message from %s: %v", author, err)
-		} else {
-			log.Printf("Published: chat_id=%d author=%s is_edit=%v text=%q", rabbitMsg.ChatID, author, isEdit, rabbitMsg.Text)
+			switch {
+			case update.Message != nil && update.Message.Text != "":
+				msg = update.Message
+			case update.EditedMessage != nil && update.EditedMessage.Text != "":
+				msg = update.EditedMessage
+				isEdit = true
+			default:
+				continue
+			}
+
+			author := msg.From.FirstName
+			if msg.From.Username != "" {
+				author = "@" + msg.From.Username
+			}
+
+			rabbitMsg := RabbitMessage{
+				MessageID: msg.MessageID,
+				ChatID:    msg.Chat.ID,
+				Text:      msg.Text,
+				Author:    author,
+				Timestamp: time.Unix(msg.Date, 0).Format(time.RFC3339),
+				IsEdit:    isEdit,
+			}
+
+			if err := publishToRabbit(publisher, queueName, rabbitMsg); err != nil {
+				log.Printf("Failed to publish message from %s: %v", author, err)
+			} else {
+				log.Printf("Published: chat_id=%d author=%s is_edit=%v text=%q", rabbitMsg.ChatID, author, isEdit, rabbitMsg.Text)
+			}
 		}
 	}
 }

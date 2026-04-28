@@ -123,10 +123,7 @@ func publishToRabbit(publisher *rabbitmq.Publisher, queueName string, msg Rabbit
 }
 
 func main() {
-	if err := godotenv.Load(); err != nil {
-		log.Fatal("Error loading .env file")
-	}
-
+	_ = godotenv.Load()
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	rabbitURL := os.Getenv("RABBITMQ_URL")
 	queueName := os.Getenv("RABBITMQ_QUEUE")

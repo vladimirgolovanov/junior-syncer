@@ -21,7 +21,7 @@ WORKDIR /app
 RUN apk add --no-cache ca-certificates tzdata
 
 COPY --from=builder /app/app /app/app
-COPY .env /app/.env
+#COPY .env /app/.env
 
 RUN addgroup -S app && adduser -S app -G app
 USER app

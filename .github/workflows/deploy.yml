@@ -1,0 +1,58 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [master]
+
+env:
+  IMAGE_NAME: ghcr.io/vladimirgolovanov/junior-syncer
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:latest
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_BASE64 }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Apply secrets
+        run: |
+          kubectl create namespace junior-syncer --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret generic junior-syncer-env \
+            --namespace junior-syncer \
+            --from-literal=TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
+            --from-literal=RABBITMQ_URL="${{ secrets.RABBITMQ_URL }}" \
+            --from-literal=RABBITMQ_QUEUE="${{ secrets.RABBITMQ_QUEUE }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy
+        run: |
+          kubectl apply -f k8s/
+          kubectl rollout restart deployment/junior-syncer -n junior-syncer
+          kubectl rollout status deployment/junior-syncer -n junior-syncer --timeout=120s

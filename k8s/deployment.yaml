@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: junior-syncer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: junior-syncer
+  namespace: junior-syncer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: junior-syncer
+  template:
+    metadata:
+      labels:
+        app: junior-syncer
+    spec:
+      imagePullSecrets:
+        - name: ghcr-secret
+      containers:
+        - name: junior-syncer
+          image: ghcr.io/vladimirgolovanov/junior-syncer:latest
+          envFrom:
+            - secretRef:
+                name: junior-syncer-env

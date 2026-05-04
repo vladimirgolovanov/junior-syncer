@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/joho/godotenv"
 	amqp "github.com/rabbitmq/amqp091-go"
 	rabbitmq "github.com/wagslane/go-rabbitmq"
@@ -238,7 +239,11 @@ func startSendConsumer(conn *rabbitmq.Conn, publisher *rabbitmq.Publisher, botTo
 			tgID, err := sendTGMessage(botToken, cmd.ChatID, cmd.Text)
 			if err != nil {
 				log.Printf("Failed to send TG message (cmd_id=%d): %v", cmd.ID, err)
-				return rabbitmq.NackRequeue
+				sentry.WithScope(func(scope *sentry.Scope) {
+					scope.SetContext("rabbitmq", sentry.Context{"queue": tgCommandsQueue, "payload": cmd})
+					sentry.CaptureException(err)
+				})
+				return rabbitmq.NackDiscard
 			}
 			log.Printf("Created TG message: cmd_id=%d tg_message_id=%d", cmd.ID, tgID)
 
@@ -250,7 +255,11 @@ func startSendConsumer(conn *rabbitmq.Conn, publisher *rabbitmq.Publisher, botTo
 		case "update":
 			if err := editTGMessage(botToken, cmd.ChatID, cmd.TGMessageID, cmd.Text); err != nil {
 				log.Printf("Failed to edit TG message (cmd_id=%d tg_message_id=%d): %v", cmd.ID, cmd.TGMessageID, err)
-				return rabbitmq.NackRequeue
+				sentry.WithScope(func(scope *sentry.Scope) {
+					scope.SetContext("rabbitmq", sentry.Context{"queue": tgCommandsQueue, "payload": cmd})
+					sentry.CaptureException(err)
+				})
+				return rabbitmq.NackDiscard
 			}
 			log.Printf("Edited TG message: cmd_id=%d tg_message_id=%d", cmd.ID, cmd.TGMessageID)
 
@@ -279,6 +288,13 @@ func main() {
 	tgEventsQueue := os.Getenv("RABBITMQ_TG_EVENTS_QUEUE")
 	tgCommandsQueue := os.Getenv("RABBITMQ_TG_COMMANDS_QUEUE")
 	tgCommandsResponsesQueue := os.Getenv("RABBITMQ_TG_COMMANDS_RESPONSES_QUEUE")
+
+	if err := sentry.Init(sentry.ClientOptions{
+		Dsn: os.Getenv("SENTRY_DSN"),
+	}); err != nil {
+		log.Printf("Sentry init failed: %v", err)
+	}
+	defer sentry.Flush(2 * time.Second)
 
 	var ignoreUserID int64
 	if raw := os.Getenv("TELEGRAM_IGNORE_USER_ID"); raw != "" {

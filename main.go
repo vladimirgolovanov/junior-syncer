@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -45,6 +47,12 @@ type UpdatesResponse struct {
 	Result []Update `json:"result"`
 }
 
+type TGSendResponse struct {
+	OK     bool    `json:"ok"`
+	Result Message `json:"result"`
+}
+
+// RabbitMessage is published to the outbound queue when a TG message is received/edited.
 type RabbitMessage struct {
 	MessageID int    `json:"message_id"`
 	ChatID    int64  `json:"chat_id"`
@@ -52,6 +60,21 @@ type RabbitMessage struct {
 	Author    string `json:"author"`
 	Timestamp string `json:"timestamp"`
 	IsEdit    bool   `json:"is_edit"`
+}
+
+// SendCommand is consumed from the inbound queue to create or edit a TG message.
+type SendCommand struct {
+	ID          int    `json:"id"`     // internal ID from the sender
+	Action      string `json:"action"` // "create" or "edit"
+	ChatID      int64  `json:"chat_id"`
+	Text        string `json:"text"`
+	TGMessageID int    `json:"tg_message_id"` // required for "edit"
+}
+
+// SendResponse is published after a TG message is created.
+type SendResponse struct {
+	ID          int `json:"id"`
+	TGMessageID int `json:"tg_message_id"`
 }
 
 func getUpdates(token string, offset int) ([]Update, error) {
@@ -80,6 +103,77 @@ func getUpdates(token string, offset int) ([]Update, error) {
 	return result.Result, nil
 }
 
+func sendTGMessage(token string, chatID int64, text string) (int, error) {
+	apiURL := fmt.Sprintf("%s%s/sendMessage", telegramAPI, token)
+
+	payload := map[string]any{
+		"chat_id": chatID,
+		"text":    text,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, err
+	}
+
+	resp, err := http.Post(apiURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+
+	var result TGSendResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return 0, err
+	}
+
+	if !result.OK {
+		return 0, fmt.Errorf("telegram sendMessage returned not OK: %s", respBody)
+	}
+
+	return result.Result.MessageID, nil
+}
+
+func editTGMessage(token string, chatID int64, messageID int, text string) error {
+	apiURL := fmt.Sprintf("%s%s/editMessageText", telegramAPI, token)
+
+	payload := map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+		"text":       text,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.Post(apiURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	var result TGSendResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return err
+	}
+
+	if !result.OK {
+		return fmt.Errorf("telegram editMessageText returned not OK: %s", respBody)
+	}
+
+	return nil
+}
+
 // declareQueue создаёт очередь при старте через amqp091 напрямую.
 // go-rabbitmq не декларирует очереди на стороне publisher-а.
 func declareQueue(rabbitURL, queueName string) error {
@@ -106,13 +200,13 @@ func declareQueue(rabbitURL, queueName string) error {
 	return err
 }
 
-func publishToRabbit(publisher *rabbitmq.Publisher, queueName string, msg RabbitMessage) error {
-	body, err := json.Marshal(msg)
+func publishToRabbit(publisher *rabbitmq.Publisher, queueName string, payload any) error {
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("Published: %s\n", body)
+	fmt.Printf("Published to %s: %s\n", queueName, body)
 
 	return publisher.Publish(
 		body,
@@ -122,14 +216,84 @@ func publishToRabbit(publisher *rabbitmq.Publisher, queueName string, msg Rabbit
 	)
 }
 
+func startSendConsumer(conn *rabbitmq.Conn, publisher *rabbitmq.Publisher, botToken, tgCommandsQueue, tgCommandsResponsesQueue string) error {
+	consumer, err := rabbitmq.NewConsumer(
+		conn,
+		tgCommandsQueue,
+		rabbitmq.WithConsumerOptionsQueueDurable,
+	)
+	if err != nil {
+		return err
+	}
+
+	handler := func(d rabbitmq.Delivery) rabbitmq.Action {
+		var cmd SendCommand
+		if err := json.Unmarshal(d.Body, &cmd); err != nil {
+			log.Printf("Failed to parse SendCommand: %v", err)
+			return rabbitmq.NackDiscard
+		}
+
+		switch cmd.Action {
+		case "create":
+			tgID, err := sendTGMessage(botToken, cmd.ChatID, cmd.Text)
+			if err != nil {
+				log.Printf("Failed to send TG message (cmd_id=%d): %v", cmd.ID, err)
+				return rabbitmq.NackRequeue
+			}
+			log.Printf("Created TG message: cmd_id=%d tg_message_id=%d", cmd.ID, tgID)
+
+			resp := SendResponse{ID: cmd.ID, TGMessageID: tgID}
+			if err := publishToRabbit(publisher, tgCommandsResponsesQueue, resp); err != nil {
+				log.Printf("Failed to publish SendResponse: %v", err)
+			}
+
+		case "update":
+			if err := editTGMessage(botToken, cmd.ChatID, cmd.TGMessageID, cmd.Text); err != nil {
+				log.Printf("Failed to edit TG message (cmd_id=%d tg_message_id=%d): %v", cmd.ID, cmd.TGMessageID, err)
+				return rabbitmq.NackRequeue
+			}
+			log.Printf("Edited TG message: cmd_id=%d tg_message_id=%d", cmd.ID, cmd.TGMessageID)
+
+		default:
+			log.Printf("Unknown action %q in SendCommand (cmd_id=%d)", cmd.Action, cmd.ID)
+			return rabbitmq.NackDiscard
+		}
+
+		return rabbitmq.Ack
+	}
+
+	go func() {
+		log.Printf("Send consumer started, listening on %s", tgCommandsQueue)
+		if err := consumer.Run(handler); err != nil {
+			log.Printf("Send consumer error: %v", err)
+		}
+	}()
+
+	return nil
+}
+
 func main() {
 	_ = godotenv.Load()
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	rabbitURL := os.Getenv("RABBITMQ_URL")
-	queueName := os.Getenv("RABBITMQ_QUEUE")
+	tgEventsQueue := os.Getenv("RABBITMQ_TG_EVENTS_QUEUE")
+	tgCommandsQueue := os.Getenv("RABBITMQ_TG_COMMANDS_QUEUE")
+	tgCommandsResponsesQueue := os.Getenv("RABBITMQ_TG_COMMANDS_RESPONSES_QUEUE")
 
-	if err := declareQueue(rabbitURL, queueName); err != nil {
-		log.Fatalf("Failed to declare queue: %v", err)
+	var ignoreUserID int64
+	if raw := os.Getenv("TELEGRAM_IGNORE_USER_ID"); raw != "" {
+		if id, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			ignoreUserID = id
+		}
+	}
+
+	for _, q := range []string{tgEventsQueue, tgCommandsQueue, tgCommandsResponsesQueue} {
+		if q == "" {
+			continue
+		}
+		if err := declareQueue(rabbitURL, q); err != nil {
+			log.Fatalf("Failed to declare queue %q: %v", q, err)
+		}
 	}
 
 	conn, err := rabbitmq.NewConn(
@@ -149,6 +313,12 @@ func main() {
 		log.Fatalf("Failed to create publisher: %v", err)
 	}
 	defer publisher.Close()
+
+	if tgCommandsQueue != "" && tgCommandsResponsesQueue != "" {
+		if err := startSendConsumer(conn, publisher, botToken, tgCommandsQueue, tgCommandsResponsesQueue); err != nil {
+			log.Fatalf("Failed to start send consumer: %v", err)
+		}
+	}
 
 	offset := 0
 	for {
@@ -177,6 +347,10 @@ func main() {
 				continue
 			}
 
+			if ignoreUserID != 0 && msg.From != nil && msg.From.ID == ignoreUserID {
+				continue
+			}
+
 			author := msg.From.FirstName
 			if msg.From.Username != "" {
 				author = "@" + msg.From.Username
@@ -191,7 +365,7 @@ func main() {
 				IsEdit:    isEdit,
 			}
 
-			if err := publishToRabbit(publisher, queueName, rabbitMsg); err != nil {
+			if err := publishToRabbit(publisher, tgEventsQueue, rabbitMsg); err != nil {
 				log.Printf("Failed to publish message from %s: %v", author, err)
 			} else {
 				log.Printf("Published: chat_id=%d author=%s is_edit=%v text=%q", rabbitMsg.ChatID, author, isEdit, rabbitMsg.Text)

@@ -48,7 +48,9 @@ jobs:
             --namespace junior-syncer \
             --from-literal=TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
             --from-literal=RABBITMQ_URL="${{ secrets.RABBITMQ_URL }}" \
-            --from-literal=RABBITMQ_QUEUE="${{ secrets.RABBITMQ_QUEUE }}" \
+            --from-literal=RABBITMQ_TG_EVENTS_QUEUE="${{ secrets.RABBITMQ_TG_EVENTS_QUEUE }}" \
+            --from-literal=RABBITMQ_TG_COMMANDS_QUEUE="${{ secrets.RABBITMQ_TG_COMMANDS_QUEUE }}" \
+            --from-literal=RABBITMQ_TG_COMMANDS_RESPONSES_QUEUE="${{ RABBITMQ_TG_COMMANDS_RESPONSES_QUEUE.RABBITMQ_QUEUE }}" \
             --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Deploy

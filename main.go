@@ -175,6 +175,41 @@ func editTGMessage(token string, chatID int64, messageID int, text string) error
 	return nil
 }
 
+func deleteTGMessage(token string, chatID int64, messageID int) error {
+	apiURL := fmt.Sprintf("%s%s/deleteMessage", telegramAPI, token)
+
+	payload := map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.Post(apiURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	var result TGSendResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return err
+	}
+
+	if !result.OK {
+		return fmt.Errorf("telegram deleteMessage returned not OK: %s", respBody)
+	}
+
+	return nil
+}
+
 // declareQueue создаёт очередь при старте через amqp091 напрямую.
 // go-rabbitmq не декларирует очереди на стороне publisher-а.
 func declareQueue(rabbitURL, queueName string) error {
@@ -262,6 +297,17 @@ func startSendConsumer(conn *rabbitmq.Conn, publisher *rabbitmq.Publisher, botTo
 				return rabbitmq.NackDiscard
 			}
 			log.Printf("Edited TG message: cmd_id=%d tg_message_id=%d", cmd.ID, cmd.TGMessageID)
+
+		case "delete":
+			if err := deleteTGMessage(botToken, cmd.ChatID, cmd.TGMessageID); err != nil {
+				log.Printf("Failed to delete TG message (cmd_id=%d tg_message_id=%d): %v", cmd.ID, cmd.TGMessageID, err)
+				sentry.WithScope(func(scope *sentry.Scope) {
+					scope.SetContext("rabbitmq", sentry.Context{"queue": tgCommandsQueue, "payload": cmd})
+					sentry.CaptureException(err)
+				})
+				return rabbitmq.NackDiscard
+			}
+			log.Printf("Deleted TG message: cmd_id=%d tg_message_id=%d", cmd.ID, cmd.TGMessageID)
 
 		default:
 			log.Printf("Unknown action %q in SendCommand (cmd_id=%d)", cmd.Action, cmd.ID)

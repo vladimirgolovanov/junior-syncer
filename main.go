@@ -227,10 +227,10 @@ func declareQueue(rabbitURL, queueName string) error {
 
 	_, err = ch.QueueDeclare(
 		queueName,
-		true,  // durable
-		false, // auto-delete
-		false, // exclusive
-		false, // no-wait
+		true,
+		false,
+		false,
+		false,
 		nil,
 	)
 	return err
@@ -280,7 +280,7 @@ func startSendConsumer(conn *rabbitmq.Conn, publisher *rabbitmq.Publisher, botTo
 				})
 				return rabbitmq.NackDiscard
 			}
-			log.Printf("Created TG message: cmd_id=%d tg_message_id=%d", cmd.ID, tgID)
+			log.Printf("Created TG message: cmd_id=%d tg_message_id=%d text=%s", cmd.ID, tgID, cmd.Text)
 
 			resp := SendResponse{ID: cmd.ID, TGMessageID: tgID}
 			if err := publishToRabbit(publisher, tgCommandsResponsesQueue, resp); err != nil {
@@ -289,14 +289,14 @@ func startSendConsumer(conn *rabbitmq.Conn, publisher *rabbitmq.Publisher, botTo
 
 		case "update":
 			if err := editTGMessage(botToken, cmd.ChatID, cmd.TGMessageID, cmd.Text); err != nil {
-				log.Printf("Failed to edit TG message (cmd_id=%d tg_message_id=%d): %v", cmd.ID, cmd.TGMessageID, err)
+				log.Printf("Failed to edit TG message (cmd_id=%d tg_message_id=%d text=%s): %v", cmd.ID, cmd.TGMessageID, cmd.Text, err)
 				sentry.WithScope(func(scope *sentry.Scope) {
 					scope.SetContext("rabbitmq", sentry.Context{"queue": tgCommandsQueue, "payload": cmd})
 					sentry.CaptureException(err)
 				})
 				return rabbitmq.NackDiscard
 			}
-			log.Printf("Edited TG message: cmd_id=%d tg_message_id=%d", cmd.ID, cmd.TGMessageID)
+			log.Printf("Edited TG message: cmd_id=%d tg_message_id=%d text=%s", cmd.ID, cmd.TGMessageID, cmd.Text)
 
 		case "delete":
 			if err := deleteTGMessage(botToken, cmd.ChatID, cmd.TGMessageID); err != nil {
